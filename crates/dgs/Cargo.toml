@@ -1,0 +1,21 @@
+[package]
+name = "dgs"
+description = "Dynamic geometry software (GeoGebra-like) canvas for Rust: typst-like API, dgs! DSL macro, SVG and PNG rendering"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["geometry", "svg", "png", "plotting", "dsl"]
+categories = ["graphics", "rendering", "visualization"]
+
+[features]
+default = ["png"]
+png = ["dep:resvg"]
+
+[dependencies]
+serde = { workspace = true }
+dgs-macros = { workspace = true }
+resvg = { version = "0.48", optional = true }
+
+[dev-dependencies]

@@ -1,0 +1,21 @@
+[package]
+name = "dgs-macros"
+description = "Proc-macro DSL for the dgs dynamic geometry canvas (see the `dgs` crate)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["geometry", "dsl", "macro", "svg", "plotting"]
+categories = ["graphics", "rendering", "visualization"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2.0", features = ["full", "extra-traits"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+
+[dev-dependencies]
+dgs = { path = "../dgs" }
