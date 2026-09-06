@@ -113,6 +113,8 @@ pub enum Object {
         t_min: Option<f64>,
         t_max: Option<f64>,
         var_name: String,
+        samples: Option<usize>,
+        tolerance: Option<f64>,
         color: Option<Color>,
         stroke: Option<f64>,
     },
@@ -122,6 +124,8 @@ pub enum Object {
         y_expr: String,
         t_min: Option<f64>,
         t_max: Option<f64>,
+        samples: Option<usize>,
+        tolerance: Option<f64>,
         color: Option<Color>,
         stroke: Option<f64>,
     },
@@ -276,13 +280,16 @@ pub fn semicircle(from: impl Into<PointRef>, to: impl Into<PointRef>) -> Object 
     }
 }
 
-/// Mirrors `dgs-eq(expr)` (`var` defaults to `"x"`, range to `-10..10`).
+/// Mirrors `dgs-eq(expr)` (`var` defaults to `"x"`, range defaults to the
+/// viewport's x-range at render time).
 pub fn eq(expr: &str) -> Object {
     Object::Curve {
         expr_str: expr.to_string(),
         var_name: "x".to_string(),
         t_min: None,
         t_max: None,
+        samples: None,
+        tolerance: None,
         color: None,
         stroke: None,
     }
@@ -295,6 +302,8 @@ pub fn eq_param(x_expr: &str, y_expr: &str) -> Object {
         y_expr: y_expr.to_string(),
         t_min: None,
         t_max: None,
+        samples: None,
+        tolerance: None,
         color: None,
         stroke: None,
     }
@@ -417,6 +426,44 @@ impl Object {
         }
         self
     }
+
+    /// Set the base sample count for curve sampling (default 256).
+    ///
+    /// Higher values give smoother curves; adaptive subdivision (guided by
+    /// a numerical derivative / midpoint-deviation estimate) then refines
+    /// high-curvature spans up to `8 * samples` points.
+    pub fn with_samples(mut self, n: usize) -> Self {
+        match &mut self {
+            Object::Curve { samples, .. } | Object::CurveParam { samples, .. } => {
+                *samples = Some(n.max(2));
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// Set the adaptive-subdivision tolerance in math units (default:
+    /// viewport height * 0.001). Smaller values subdivide more aggressively.
+    pub fn with_tolerance(mut self, tol: f64) -> Self {
+        match &mut self {
+            Object::Curve { tolerance, .. } | Object::CurveParam { tolerance, .. } => {
+                *tolerance = Some(tol);
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// Alias for [`Object::with_samples`].
+    pub fn with_precision(mut self, n: usize) -> Self {
+        match &mut self {
+            Object::Curve { samples, .. } | Object::CurveParam { samples, .. } => {
+                *samples = Some(n.max(2));
+            }
+            _ => {}
+        }
+        self
+    }
 }
 
 pub fn build_point_lookup(objects: &[Object]) -> HashMap<String, (f64, f64)> {
@@ -437,6 +484,7 @@ pub fn build_point_lookup(objects: &[Object]) -> HashMap<String, (f64, f64)> {
 pub fn resolve_objects(
     objects: &[Object],
     lookup: &HashMap<String, (f64, f64)>,
+    viewport: &crate::viewport::Viewport,
 ) -> Vec<Object> {
     let mut resolved = Vec::with_capacity(objects.len());
     for obj in objects {
@@ -548,10 +596,25 @@ pub fn resolve_objects(
                 t_min,
                 t_max,
                 var_name,
+                samples,
+                tolerance,
                 color,
                 stroke,
             } => {
-                let points = evaluate_curve(expr_str, var_name, *t_min, *t_max, lookup);
+                // Fix #1: with no explicit range, sample the viewport's
+                // x-range instead of a hardcoded -10..10.
+                let lo = t_min.unwrap_or(viewport.x1);
+                let hi = t_max.unwrap_or(viewport.x2);
+                let points = evaluate_curve(
+                    expr_str,
+                    var_name,
+                    lo,
+                    hi,
+                    samples.unwrap_or(DEFAULT_SAMPLES),
+                    tolerance.unwrap_or_else(|| default_tolerance(viewport)),
+                    viewport,
+                    lookup,
+                );
                 resolved.push(Object::ResolvedCurve {
                     points,
                     color: *color,
@@ -563,10 +626,20 @@ pub fn resolve_objects(
                 y_expr,
                 t_min,
                 t_max,
+                samples,
+                tolerance,
                 color,
                 stroke,
             } => {
-                let points = evaluate_parametric(x_expr, y_expr, *t_min, *t_max);
+                let points = evaluate_parametric(
+                    x_expr,
+                    y_expr,
+                    t_min.unwrap_or(0.0),
+                    t_max.unwrap_or(std::f64::consts::TAU),
+                    samples.unwrap_or(DEFAULT_SAMPLES),
+                    tolerance.unwrap_or_else(|| default_tolerance(viewport)),
+                    viewport,
+                );
                 resolved.push(Object::ResolvedCurve {
                     points,
                     color: *color,
@@ -591,44 +664,168 @@ fn resolve_point_ref(pr: &PointRef, lookup: &HashMap<String, (f64, f64)>) -> Poi
     }
 }
 
+/// Default base sample count (override per curve via `with_samples`).
+pub const DEFAULT_SAMPLES: usize = 256;
+/// Max adaptive-subdivision depth per base interval.
+const MAX_DEPTH: u32 = 10;
+
+fn default_tolerance(viewport: &crate::viewport::Viewport) -> f64 {
+    ((viewport.y2 - viewport.y1).abs() * 0.001).max(1e-9)
+}
+
+fn eval_y(
+    expr: &crate::parser::Expr,
+    var_name: &str,
+    t: f64,
+) -> Option<f64> {
+    match crate::parser::eval(expr, &[(var_name, t)]) {
+        Ok(y) if y.is_finite() => Some(y),
+        _ => None,
+    }
+}
+
+/// Break threshold: a jump larger than this is treated as a discontinuity
+/// (asymptote), not a steep-but-continuous slope. Fix #2: previously the
+/// polyline was drawn straight across asymptotes, producing vertical
+/// streaks / "random bumps" on e.g. linear-fractional functions.
+fn jump_threshold(viewport: &crate::viewport::Viewport) -> f64 {
+    ((viewport.y2 - viewport.y1).abs() * 4.0).max(1e-6)
+}
+
+fn subdivide(
+    expr: &crate::parser::Expr,
+    var_name: &str,
+    t0: f64,
+    y0: f64,
+    t1: f64,
+    y1: f64,
+    tol: f64,
+    jump: f64,
+    depth: u32,
+    out: &mut Vec<(f64, f64)>,
+) {
+    let tm = 0.5 * (t0 + t1);
+    let Some(ym) = eval_y(expr, var_name, tm) else {
+        // Non-finite midpoint: discontinuity inside -> break the polyline.
+        out.push((t0, y0));
+        out.push((f64::NAN, f64::NAN));
+        out.push((t1, y1));
+        return;
+    };
+    // Derivative-guided discontinuity check: if the midpoint is wildly off
+    // the chord (or the chord itself jumps), this is an asymptote.
+    let chord = 0.5 * (y0 + y1);
+    if (y1 - y0).abs() > jump && (ym - chord).abs() > jump * 0.25 {
+        out.push((t0, y0));
+        out.push((f64::NAN, f64::NAN));
+        out.push((t1, y1));
+        return;
+    }
+    if depth >= MAX_DEPTH || (ym - chord).abs() <= tol {
+        out.push((t0, y0));
+        return;
+    }
+    subdivide(expr, var_name, t0, y0, tm, ym, tol, jump, depth + 1, out);
+    subdivide(expr, var_name, tm, ym, t1, y1, tol, jump, depth + 1, out);
+}
+
 fn evaluate_curve(
     expr_str: &str,
     var_name: &str,
-    t_min: Option<f64>,
-    t_max: Option<f64>,
+    t_min: f64,
+    t_max: f64,
+    samples: usize,
+    tol: f64,
+    viewport: &crate::viewport::Viewport,
     _lookup: &HashMap<String, (f64, f64)>,
 ) -> Vec<(f64, f64)> {
     let expr = match crate::parser::parse(expr_str) {
         Ok(e) => e,
         Err(_) => return Vec::new(),
     };
+    if !(t_min.is_finite() && t_max.is_finite()) || t_max <= t_min {
+        return Vec::new();
+    }
+    let base = samples.max(2);
+    let jump = jump_threshold(viewport);
+    // Hard cap so adversarial expressions can't blow up memory.
+    let cap = (base * 16).max(64);
 
-    let default_min = -10.0;
-    let default_max = 10.0;
-    let min = t_min.unwrap_or(default_min);
-    let max = t_max.unwrap_or(default_max);
-    let steps = 200;
-    let dt = (max - min) / steps as f64;
-
-    let mut points = Vec::with_capacity(steps + 1);
-
-    for i in 0..=steps {
-        let t = min + dt * i as f64;
-        if let Ok(y) = crate::parser::eval(&expr, &[(var_name, t)]) {
-            if y.is_finite() {
-                points.push((t, y));
-            }
-        }
+    let mut grid: Vec<Option<f64>> = Vec::with_capacity(base + 1);
+    for i in 0..=base {
+        let t = t_min + (t_max - t_min) * i as f64 / base as f64;
+        grid.push(eval_y(&expr, var_name, t));
     }
 
-    points
+    let mut out: Vec<(f64, f64)> = Vec::with_capacity(base + 1);
+    for i in 0..base {
+        if out.len() > cap {
+            break;
+        }
+        let t0 = t_min + (t_max - t_min) * i as f64 / base as f64;
+        let t1 = t_min + (t_max - t_min) * (i + 1) as f64 / base as f64;
+        match (grid[i], grid[i + 1]) {
+            (Some(y0), Some(y1)) => {
+                // Fast path: straight (e.g. linear) spans emit no extra
+                // points — the midpoint lies on the chord, so no bumps.
+                let tm = 0.5 * (t0 + t1);
+                match eval_y(&expr, var_name, tm) {
+                    None => {
+                        out.push((t0, y0));
+                        out.push((f64::NAN, f64::NAN));
+                    }
+                    Some(ym) => {
+                        let chord = 0.5 * (y0 + y1);
+                        if (y1 - y0).abs() > jump && (ym - chord).abs() > jump * 0.25 {
+                            out.push((t0, y0));
+                            out.push((f64::NAN, f64::NAN));
+                        } else if (ym - chord).abs() <= tol {
+                            out.push((t0, y0));
+                        } else {
+                            let mut seg = Vec::new();
+                            subdivide(
+                                &expr, var_name, t0, y0, tm, ym, tol, jump, 1, &mut seg,
+                            );
+                            out.extend(seg);
+                            let mut seg2 = Vec::new();
+                            subdivide(
+                                &expr, var_name, tm, ym, t1, y1, tol, jump, 1, &mut seg2,
+                            );
+                            out.extend(seg2);
+                        }
+                    }
+                }
+            }
+            (Some(y0), None) | (None, Some(y0)) => {
+                let t = if grid[i].is_some() { t0 } else { t1 };
+                out.push((t, y0));
+                out.push((f64::NAN, f64::NAN));
+            }
+            (None, None) => {}
+        }
+    }
+    // Push final valid grid point.
+    for i in (0..=base).rev() {
+        if let Some(y) = grid[i] {
+            let t = t_min + (t_max - t_min) * i as f64 / base as f64;
+            out.push((t, y));
+            break;
+        }
+    }
+    if out.len() > cap {
+        out.truncate(cap);
+    }
+    out
 }
 
 fn evaluate_parametric(
     x_expr_str: &str,
     y_expr_str: &str,
-    t_min: Option<f64>,
-    t_max: Option<f64>,
+    t_min: f64,
+    t_max: f64,
+    samples: usize,
+    tol: f64,
+    viewport: &crate::viewport::Viewport,
 ) -> Vec<(f64, f64)> {
     let x_expr = match crate::parser::parse(x_expr_str) {
         Ok(e) => e,
@@ -638,28 +835,106 @@ fn evaluate_parametric(
         Ok(e) => e,
         Err(_) => return Vec::new(),
     };
+    if !(t_min.is_finite() && t_max.is_finite()) || t_max <= t_min {
+        return Vec::new();
+    }
+    let base = samples.max(2);
+    let cap = (base * 16).max(64);
+    let scale = (viewport.x2 - viewport.x1).abs().max((viewport.y2 - viewport.y1).abs()).max(1e-9);
+    let jump = scale * 4.0;
 
-    let default_min = 0.0;
-    let default_max = std::f64::consts::TAU;
-    let min = t_min.unwrap_or(default_min);
-    let max = t_max.unwrap_or(default_max);
-    let steps = 200;
-    let dt = (max - min) / steps as f64;
+    let eval_pt = |t: f64| -> Option<(f64, f64)> {
+        match (
+            crate::parser::eval(&x_expr, &[("t", t)]),
+            crate::parser::eval(&y_expr, &[("t", t)]),
+        ) {
+            (Ok(x), Ok(y)) if x.is_finite() && y.is_finite() => Some((x, y)),
+            _ => None,
+        }
+    };
 
-    let mut points = Vec::with_capacity(steps + 1);
-
-    for i in 0..=steps {
-        let t = min + dt * i as f64;
-        let x = crate::parser::eval(&x_expr, &[("t", t)]);
-        let y = crate::parser::eval(&y_expr, &[("t", t)]);
-        if let (Ok(x_val), Ok(y_val)) = (x, y) {
-            if x_val.is_finite() && y_val.is_finite() {
-                points.push((x_val, y_val));
+    let mut out: Vec<(f64, f64)> = Vec::with_capacity(base + 1);
+    let mut prev_t = t_min;
+    let mut prev_p = eval_pt(t_min);
+    // Adaptive midpoint subdivision using the numerical-deviation estimate.
+    let mut stack: Vec<(f64, Option<(f64, f64)>, f64, Option<(f64, f64)>, u32)> = Vec::new();
+    for i in 0..base {
+        let t1 = t_min + (t_max - t_min) * (i + 1) as f64 / base as f64;
+        let p1 = eval_pt(t1);
+        stack.push((prev_t, prev_p, t1, p1, 0));
+        prev_t = t1;
+        prev_p = p1;
+    }
+    // Process in order: collect refined points per interval.
+    let mut ordered: Vec<(f64, Option<(f64, f64)>)> = Vec::new();
+    ordered.push((t_min, eval_pt(t_min)));
+    // Simple approach: iterate base intervals in order, refining each.
+    ordered.clear();
+    let mut ts: Vec<f64> = (0..=base)
+        .map(|i| t_min + (t_max - t_min) * i as f64 / base as f64)
+        .collect();
+    // Refine pass: insert midpoints where deviation exceeds tol.
+    for _ in 0..MAX_DEPTH {
+        let mut inserted = false;
+        let mut j = 0;
+        while j + 1 < ts.len() && ts.len() < cap {
+            let (a, b) = (ts[j], ts[j + 1]);
+            let (pa, pb) = (eval_pt(a), eval_pt(b));
+            let m = 0.5 * (a + b);
+            let pm = eval_pt(m);
+            let need = match (pa, pb, pm) {
+                (Some(pa), Some(pb), Some(pm)) => {
+                    let chord = (0.5 * (pa.0 + pb.0), 0.5 * (pa.1 + pb.1));
+                    let dev = ((pm.0 - chord.0).powi(2) + (pm.1 - chord.1).powi(2)).sqrt();
+                    let seg = ((pb.0 - pa.0).powi(2) + (pb.1 - pa.1).powi(2)).sqrt();
+                    // Derivative-guided break on teleporting spans.
+                    if seg > jump {
+                        false
+                    } else {
+                        dev > tol
+                    }
+                }
+                _ => false,
+            };
+            if need {
+                ts.insert(j + 1, m);
+                inserted = true;
+                j += 2;
+            } else {
+                j += 1;
             }
         }
+        if !inserted {
+            break;
+        }
     }
-
-    points
+    let mut prev_valid = false;
+    for t in ts {
+        match eval_pt(t) {
+            Some(p) => {
+                // Break across teleporting jumps (derivative check).
+                if let Some(last) = out.last().filter(|_| prev_valid) {
+                    let d = ((p.0 - last.0).powi(2) + (p.1 - last.1).powi(2)).sqrt();
+                    if d > jump {
+                        out.push((f64::NAN, f64::NAN));
+                    }
+                }
+                out.push(p);
+                prev_valid = true;
+            }
+            None => {
+                if prev_valid {
+                    out.push((f64::NAN, f64::NAN));
+                }
+                prev_valid = false;
+            }
+        }
+        if out.len() >= cap {
+            break;
+        }
+    }
+    let _ = stack;
+    out
 }
 
 #[cfg(test)]
@@ -688,7 +963,8 @@ mod tests {
 
     #[test]
     fn test_resolve_curve() {
-        let points = evaluate_curve("x^2", "x", Some(0.0), Some(2.0), &HashMap::new());
+        let vp = crate::viewport::Viewport::new(-10.0, -10.0, 10.0, 10.0, 200.0, 200.0);
+        let points = evaluate_curve("x^2", "x", 0.0, 2.0, DEFAULT_SAMPLES, default_tolerance(&vp), &vp, &HashMap::new());
         assert!(!points.is_empty());
         assert!((points[0].1 - 0.0).abs() < 1e-10);
     }

@@ -221,6 +221,33 @@ impl Scene {
             var_name: var.to_string(),
             t_min: Some(t_min),
             t_max: Some(t_max),
+            samples: None,
+            tolerance: None,
+            color: None,
+            stroke: None,
+        });
+        self
+    }
+
+    /// Plot `y = f(var)` with explicit precision controls: `samples` is the
+    /// base sample count and `tolerance` the adaptive-subdivision tolerance
+    /// in math units (pass `None` for defaults).
+    pub fn curve_with(
+        mut self,
+        expr: &str,
+        var: &str,
+        t_min: f64,
+        t_max: f64,
+        samples: Option<usize>,
+        tolerance: Option<f64>,
+    ) -> Self {
+        self.objects.push(Object::Curve {
+            expr_str: expr.to_string(),
+            var_name: var.to_string(),
+            t_min: Some(t_min),
+            t_max: Some(t_max),
+            samples,
+            tolerance,
             color: None,
             stroke: None,
         });
@@ -234,6 +261,31 @@ impl Scene {
             y_expr: y_expr.to_string(),
             t_min: Some(t_min),
             t_max: Some(t_max),
+            samples: None,
+            tolerance: None,
+            color: None,
+            stroke: None,
+        });
+        self
+    }
+
+    /// Plot a parametric curve with explicit precision controls.
+    pub fn curve_param_with(
+        mut self,
+        x_expr: &str,
+        y_expr: &str,
+        t_min: f64,
+        t_max: f64,
+        samples: Option<usize>,
+        tolerance: Option<f64>,
+    ) -> Self {
+        self.objects.push(Object::CurveParam {
+            x_expr: x_expr.to_string(),
+            y_expr: y_expr.to_string(),
+            t_min: Some(t_min),
+            t_max: Some(t_max),
+            samples,
+            tolerance,
             color: None,
             stroke: None,
         });
@@ -328,7 +380,7 @@ impl Scene {
 
         // 3. Build point lookup and resolve objects
         let lookup = crate::objects::build_point_lookup(&self.objects);
-        let resolved = crate::objects::resolve_objects(&self.objects, &lookup);
+        let resolved = crate::objects::resolve_objects(&self.objects, &lookup, viewport);
 
         // 4. Axes
         if self.axes {
