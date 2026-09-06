@@ -20,7 +20,7 @@ pub fn render_curve(
     let y_hi = viewport.y1.max(viewport.y2) + margin_y;
 
     let mut seg: Vec<(f64, f64)> = Vec::new();
-    let mut flush = |seg: &mut Vec<(f64, f64)>, svg: &mut SvgBuilder| {
+    let flush = |seg: &mut Vec<(f64, f64)>, svg: &mut SvgBuilder| {
         if seg.len() >= 2 {
             let svg_points: Vec<(f64, f64)> =
                 seg.iter().map(|(x, y)| viewport.to_svg(*x, *y)).collect();

@@ -1,6 +1,74 @@
 use crate::color::Color;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+
+/// Accepts `samples` as int or float (Typst numbers may arrive as floats
+/// via CBOR) or null/missing.
+fn de_opt_usize<'de, D>(d: D) -> Result<Option<usize>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct OptUsize;
+    impl<'de> serde::de::Visitor<'de> for OptUsize {
+        type Value = Option<usize>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an optional unsigned integer")
+        }
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D2: Deserializer<'de>>(
+            self,
+            d: D2,
+        ) -> Result<Self::Value, D2::Error> {
+            d.deserialize_any(Inner)
+        }
+        fn visit_bool<E: serde::de::Error>(self, _v: bool) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+    struct Inner;
+    impl<'de> serde::de::Visitor<'de> for Inner {
+        type Value = Option<usize>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an unsigned integer")
+        }
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v as usize))
+        }
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Some(v.max(0) as usize))
+        }
+        fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+            Ok(Some(v.round().max(0.0) as usize))
+        }
+        fn visit_u8<E: serde::de::Error>(self, v: u8) -> Result<Self::Value, E> {
+            Ok(Some(v as usize))
+        }
+        fn visit_u16<E: serde::de::Error>(self, v: u16) -> Result<Self::Value, E> {
+            Ok(Some(v as usize))
+        }
+        fn visit_u32<E: serde::de::Error>(self, v: u32) -> Result<Self::Value, E> {
+            Ok(Some(v as usize))
+        }
+        fn visit_i8<E: serde::de::Error>(self, v: i8) -> Result<Self::Value, E> {
+            Ok(Some(v.max(0) as usize))
+        }
+        fn visit_i16<E: serde::de::Error>(self, v: i16) -> Result<Self::Value, E> {
+            Ok(Some(v.max(0) as usize))
+        }
+        fn visit_i32<E: serde::de::Error>(self, v: i32) -> Result<Self::Value, E> {
+            Ok(Some(v.max(0) as usize))
+        }
+        fn visit_f32<E: serde::de::Error>(self, v: f32) -> Result<Self::Value, E> {
+            Ok(Some((v as f64).round().max(0.0) as usize))
+        }
+    }
+    d.deserialize_option(OptUsize)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -113,7 +181,9 @@ pub enum Object {
         t_min: Option<f64>,
         t_max: Option<f64>,
         var_name: String,
+        #[serde(default, deserialize_with = "de_opt_usize")]
         samples: Option<usize>,
+        #[serde(default)]
         tolerance: Option<f64>,
         color: Option<Color>,
         stroke: Option<f64>,
@@ -124,7 +194,9 @@ pub enum Object {
         y_expr: String,
         t_min: Option<f64>,
         t_max: Option<f64>,
+        #[serde(default, deserialize_with = "de_opt_usize")]
         samples: Option<usize>,
+        #[serde(default)]
         tolerance: Option<f64>,
         color: Option<Color>,
         stroke: Option<f64>,
